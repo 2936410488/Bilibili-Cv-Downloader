@@ -9,9 +9,9 @@ https://github.com/2936410488/Bilibili-Cv-Downloader
 - 支持按文集 ID 批量抓取 CV 专栏文章。
 - 生成带目录的 EPUB 文件。
 - 缓存已抓取的文章 HTML 和图片，重复运行时减少网络请求。
-- 自动下载正文图片、文集封面和每章 banner 图。
+- 自动下载正文图片、文集封面和每章 banner 图，重复 banner 只写入一份。
 - 支持新版页面的 `window.__INITIAL_STATE__` 正文结构。
-- 支持文章和图片并发抓取。
+- 文章和图片按顺序抓取，并在网络请求之间间隔 1 秒，减少触发限流的风险。
 
 ## 安装
 
@@ -37,10 +37,10 @@ python converter.py 702577
 
 生成的 EPUB 会保存在当前目录，文件名使用文集标题。
 
-默认文章并发数为 `4`，图片并发下载数为 `8`。如果遇到限流或请求失败，可以降低并发：
+也可以通过配置文件运行：
 
 ```bash
-python converter.py 702577 --workers 1 --image-workers 2
+python converter.py -c config.ini
 ```
 
 查看全部参数：
@@ -57,6 +57,34 @@ python converter.py --help
 
 ```text
 buvid3=...; b_nut=...; b_lsid=...; _uuid=...
+```
+
+也可以在 `config.ini` 里指定 Cookie 文件位置和文集 ID：
+
+```ini
+[converter]
+readlist_id = 702577
+cookie_file = ./cookies.txt
+```
+
+或者直接把 Cookie 按行填进配置文件；如果 `cookies` 有内容，会优先使用这里的内容：
+
+```ini
+[converter]
+readlist_id = 702577
+cookies =
+    buvid3=...
+    b_nut=...
+    SESSDATA=...
+```
+
+也支持逐项写到 `[cookies]` 段：
+
+```ini
+[cookies]
+buvid3 = ...
+b_nut = ...
+SESSDATA = ...
 ```
 
 ## 缓存

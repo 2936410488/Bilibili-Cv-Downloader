@@ -3,16 +3,17 @@ B站文集 → EPUB 转换器
 当前策略：
 1. 只请求 CV 页面，不使用 API 兜底。
 2. 正文优先解析页面 DOM，失败时解析页面内的 __INITIAL_STATE__。
-3. 每章提取 banner 图并写入 EPUB，正文图片也会下载并重写引用。
-4. 文章和图片支持并发抓取，缓存命中时不再请求网络。
+3. 每章提取 banner 图并写入 EPUB，重复 banner 只保留一份。
+4. 文章和图片按顺序抓取，网络请求间隔 1 秒，缓存命中时不再请求网络。
 """
 
 import os
 import re
 import json
 import argparse
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import configparser
+import hashlib
+import time
 from html import escape
 from urllib.parse import urlparse
 import sys
@@ -30,21 +31,19 @@ headers = {
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
 
-cookie_fn = "./cookies.txt"
-if os.path.isfile(cookie_fn):
-    with open(cookie_fn, "r") as f:
-        headers["Cookie"] = f.read().strip()
-
 # 正文有效的最低字符数（纯文本，去空格后）
 MIN_CONTENT_CHARS = 200
 REQUEST_TIMEOUT = 20
-DEFAULT_WORKERS = 4
-DEFAULT_IMAGE_WORKERS = 8
+REQUEST_DELAY_SECONDS = 1.0
 CACHE_DIR = "./.cache"
 IMAGE_CACHE_DIR = os.path.join(CACHE_DIR, "imgs")
 IMAGE_EXTS = (".avif", ".webp", ".jpg", ".jpeg", ".png", ".gif")
+DEFAULT_COOKIE_FILE = "./cookies.txt"
+CONFIG_SECTION = "converter"
+COOKIE_SECTION = "cookies"
 
-_thread_local = threading.local()
+_session: requests.Session | None = None
+_last_request_at = 0.0
 
 
 def build_session() -> requests.Session:
@@ -65,11 +64,157 @@ def build_session() -> requests.Session:
 
 
 def get_session() -> requests.Session:
-    session = getattr(_thread_local, "session", None)
-    if session is None:
-        session = build_session()
-        _thread_local.session = session
-    return session
+    global _session
+    if _session is None:
+        _session = build_session()
+    return _session
+
+
+def throttled_get(url: str, *, timeout: int | float) -> requests.Response:
+    global _last_request_at
+    elapsed = time.monotonic() - _last_request_at
+    if elapsed < REQUEST_DELAY_SECONDS:
+        time.sleep(REQUEST_DELAY_SECONDS - elapsed)
+    try:
+        return get_session().get(url, timeout=timeout)
+    finally:
+        _last_request_at = time.monotonic()
+
+
+def normalize_cookie_text(cookie_text: str) -> str:
+    cookie_parts = []
+    lines = cookie_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        if line.lower().startswith("cookie:"):
+            line = line.split(":", 1)[1].strip()
+        for part in line.split(";"):
+            part = part.strip()
+            if part:
+                cookie_parts.append(part)
+    return "; ".join(cookie_parts)
+
+
+def resolve_config_path(path: str, config_path: str | None = None) -> str:
+    expanded = os.path.expanduser(path)
+    if os.path.isabs(expanded):
+        return expanded
+    base_dir = os.path.dirname(config_path) if config_path else os.getcwd()
+    return os.path.abspath(os.path.join(base_dir, expanded))
+
+
+def load_config(path: str | None) -> tuple[configparser.ConfigParser | None, str | None]:
+    if not path:
+        return None, None
+
+    config_path = os.path.abspath(os.path.expanduser(path))
+    config = configparser.ConfigParser(interpolation=None)
+    config.optionxform = str
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config.read_file(f)
+    except OSError as e:
+        print(f"读取配置文件失败：{e}")
+        sys.exit(1)
+    except configparser.Error as e:
+        print(f"解析配置文件失败：{e}")
+        sys.exit(1)
+    return config, config_path
+
+
+def config_value(
+    config: configparser.ConfigParser | None,
+    sections: list[str],
+    names: list[str],
+) -> str:
+    if config is None:
+        return ""
+
+    wanted = {name.lower() for name in names}
+    for section in sections:
+        if section == "DEFAULT":
+            items = config.defaults().items()
+        elif config.has_section(section):
+            items = config._sections.get(section, {}).items()
+        else:
+            continue
+
+        for key, value in items:
+            if key == "__name__":
+                continue
+            if key.lower() in wanted:
+                return str(value or "").strip()
+    return ""
+
+
+def cookie_pairs_from_sections(config: configparser.ConfigParser | None, sections: list[str]) -> str:
+    if config is None:
+        return ""
+
+    reserved_names = {
+        "cookie",
+        "cookies",
+        "cookie_text",
+        "cookie_file",
+        "cookies_file",
+        "cookie_path",
+        "cookies_path",
+        "file",
+        "path",
+        "readlist_id",
+        "read_list_id",
+        "id",
+    }
+    cookie_lines = []
+    for section in sections:
+        if not config.has_section(section):
+            continue
+        for key, value in config._sections.get(section, {}).items():
+            if key == "__name__" or key.lower() in reserved_names:
+                continue
+            value = str(value or "").strip()
+            if value:
+                cookie_lines.append(f"{key}={value}")
+    return normalize_cookie_text("\n".join(cookie_lines))
+
+
+def load_cookie_file(path: str, *, explicit: bool = False) -> str:
+    if not os.path.isfile(path):
+        if explicit:
+            print(f"  [警告] Cookie 文件不存在：{path}")
+        return ""
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return normalize_cookie_text(f.read())
+
+
+def apply_cookie_config(config: configparser.ConfigParser | None, config_path: str | None):
+    global _session
+    inline_cookie = config_value(
+        config,
+        [CONFIG_SECTION, COOKIE_SECTION, "DEFAULT"],
+        ["cookies", "cookie", "cookie_text"],
+    )
+    cookie_header = normalize_cookie_text(inline_cookie) if inline_cookie else ""
+    if not cookie_header:
+        cookie_header = cookie_pairs_from_sections(config, [COOKIE_SECTION, CONFIG_SECTION])
+
+    explicit_cookie_file = config_value(
+        config,
+        [CONFIG_SECTION, COOKIE_SECTION, "DEFAULT"],
+        ["cookie_file", "cookies_file", "cookie_path", "cookies_path", "file", "path"],
+    )
+    if not cookie_header:
+        cookie_file = explicit_cookie_file or DEFAULT_COOKIE_FILE
+        cookie_path = resolve_config_path(cookie_file, config_path)
+        cookie_header = load_cookie_file(cookie_path, explicit=bool(explicit_cookie_file))
+
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    else:
+        headers.pop("Cookie", None)
+    _session = None
 
 
 # ─────────────────────────────────────────────
@@ -163,7 +308,7 @@ class ReadList:
     def fetch(self):
         url = f"https://api.bilibili.com/x/article/list/web/articles?id={self.readlist_id}"
         try:
-            response = get_session().get(url, timeout=15)
+            response = throttled_get(url, timeout=15)
             response.raise_for_status()
             data = response.json()
             if data["code"] == 0:
@@ -361,7 +506,7 @@ class CV_Article:
         url = f"https://www.bilibili.com/read/cv{self.cv_id}/?from=readlist&opus_fallback=1"
         print(f"  [CV请求] {url}")
         try:
-            resp = get_session().get(url, timeout=REQUEST_TIMEOUT)
+            resp = throttled_get(url, timeout=REQUEST_TIMEOUT)
             if resp.status_code != 200:
                 print(f"  [CV请求] HTTP {resp.status_code}")
                 return False
@@ -411,7 +556,7 @@ def download_image(url: str) -> bytes | None:
             return f.read()
 
     try:
-        response = get_session().get(url, timeout=REQUEST_TIMEOUT)
+        response = throttled_get(url, timeout=REQUEST_TIMEOUT)
         content_type = response.headers.get("content-type", "")
         if "image" not in content_type:
             print(f"  [非图片] {url}（Content-Type: {content_type}）")
@@ -445,10 +590,17 @@ def epub_image_path(url: str) -> str:
     return f"images/{get_image_filename(url)}"
 
 
-def make_banner_html(article: CV_Article) -> str:
-    if not article.banner_url:
+def banner_dedupe_key(url: str) -> str:
+    normalized = normalize_image_url(url)
+    parsed = urlparse(normalized)
+    path = parsed.path.split("@", 1)[0]
+    return f"{parsed.netloc}{path}".lower()
+
+
+def make_banner_html(article: CV_Article, banner_path: str | None) -> str:
+    if not article.banner_url or not banner_path:
         return ""
-    src = epub_image_path(article.banner_url)
+    src = banner_path
     alt = escape(article.title or "")
     return f'<p><img src="{src}" alt="{alt}" style="max-width:100%;height:auto;"/></p>'
 
@@ -458,12 +610,14 @@ def make_banner_html(article: CV_Article) -> str:
 # ─────────────────────────────────────────────
 
 class Converter:
-    def __init__(self, read_list: ReadList, articles: list[CV_Article], image_workers: int = DEFAULT_IMAGE_WORKERS):
+    def __init__(self, read_list: ReadList, articles: list[CV_Article]):
         self.read_list = read_list
         self.articles = articles
-        self.image_workers = max(1, image_workers)
+        self._added_epub_paths: set[str] = set()
 
     def _add_epub_image(self, ebook: epub.EpubBook, img_url: str, epub_path: str, image_data: bytes):
+        if epub_path in self._added_epub_paths:
+            return
         mime, ext = mime_and_ext(img_url)
         uid = re.sub(r"[^a-zA-Z0-9_]", "_", os.path.basename(epub_path))
         image_item = epub.EpubImage(
@@ -473,7 +627,47 @@ class Converter:
             content=image_data,
         )
         ebook.add_item(image_item)
+        self._added_epub_paths.add(epub_path)
         print(f"  [图片已加入] {os.path.basename(epub_path)}")
+
+    def _add_banner_images(self, ebook: epub.EpubBook) -> dict[str, str]:
+        banner_path_by_url: dict[str, str] = {}
+        banner_path_by_key: dict[str, str] = {}
+        banner_path_by_hash: dict[str, str] = {}
+
+        for article in self.articles:
+            if not article.context or not article.banner_url:
+                continue
+
+            banner_url = article.banner_url
+            dedupe_key = banner_dedupe_key(banner_url)
+            if dedupe_key in banner_path_by_key:
+                banner_path = banner_path_by_key[dedupe_key]
+                banner_path_by_url[banner_url] = banner_path
+                print(f"  [banner复用] {os.path.basename(banner_path)}")
+                continue
+
+            image_data = download_image(banner_url)
+            if not image_data:
+                continue
+
+            image_hash = hashlib.sha256(image_data).hexdigest()
+            if image_hash in banner_path_by_hash:
+                banner_path = banner_path_by_hash[image_hash]
+                banner_path_by_key[dedupe_key] = banner_path
+                banner_path_by_url[banner_url] = banner_path
+                duplicate_name = os.path.basename(epub_image_path(banner_url))
+                canonical_name = os.path.basename(banner_path)
+                print(f"  [banner重复] {duplicate_name} -> {canonical_name}")
+                continue
+
+            banner_path = epub_image_path(banner_url)
+            self._add_epub_image(ebook, banner_url, banner_path, image_data)
+            banner_path_by_key[dedupe_key] = banner_path
+            banner_path_by_hash[image_hash] = banner_path
+            banner_path_by_url[banner_url] = banner_path
+
+        return banner_path_by_url
 
     def convert_epub(self):
         ebook = epub.EpubBook()
@@ -487,6 +681,7 @@ class Converter:
             if cover_data:
                 ebook.set_cover("cover.jpg", cover_data)
 
+        banner_path_by_url = self._add_banner_images(ebook)
         chapters = []
         image_url_map: dict[str, str] = {}
 
@@ -494,7 +689,7 @@ class Converter:
             if not article.context:
                 continue
 
-            banner_html = make_banner_html(article)
+            banner_html = make_banner_html(article, banner_path_by_url.get(article.banner_url or ""))
             chapter = epub.EpubHtml(
                 title=article.title or f"第{idx+1}章",
                 file_name=f"article{idx}.xhtml",
@@ -516,26 +711,13 @@ class Converter:
             ebook.add_item(chapter)
             chapters.append(chapter)
 
-            if article.banner_url:
-                image_url_map[article.banner_url] = epub_image_path(article.banner_url)
-
             for img_url in article.images:
                 image_url_map[img_url] = epub_image_path(img_url)
 
-        with ThreadPoolExecutor(max_workers=self.image_workers) as executor:
-            future_map = {
-                executor.submit(download_image, img_url): (img_url, epub_path)
-                for img_url, epub_path in image_url_map.items()
-            }
-            for future in as_completed(future_map):
-                img_url, epub_path = future_map[future]
-                try:
-                    image_data = future.result()
-                except Exception as e:
-                    print(f"  [图片下载失败] {img_url}：{e}")
-                    continue
-                if image_data:
-                    self._add_epub_image(ebook, img_url, epub_path, image_data)
+        for img_url, epub_path in image_url_map.items():
+            image_data = download_image(img_url)
+            if image_data:
+                self._add_epub_image(ebook, img_url, epub_path, image_data)
 
         ebook.toc = [(epub.Section(self.read_list.name), chapters)]
         ebook.add_item(epub.EpubNcx())
@@ -555,46 +737,25 @@ def fetch_article(meta: dict) -> CV_Article:
     return article
 
 
-def fetch_articles(articles_meta: list[dict], workers: int) -> list[CV_Article]:
-    if workers <= 1:
-        return [fetch_article(meta) for meta in articles_meta]
-
-    articles: list[CV_Article | None] = [None] * len(articles_meta)
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_map = {
-            executor.submit(fetch_article, meta): idx
-            for idx, meta in enumerate(articles_meta)
-        }
-        for future in as_completed(future_map):
-            idx = future_map[future]
-            try:
-                articles[idx] = future.result()
-            except Exception as e:
-                cv_id = articles_meta[idx].get("cv_id", "")
-                print(f"  [异常] cv{cv_id}：{e}，保留空章节")
-                article = CV_Article(cv_id)
-                article.title = f"文章 cv{cv_id}"
-                article.context = "<p>（抓取时发生异常）</p>"
-                articles[idx] = article
-
-    return [article for article in articles if article is not None]
+def fetch_articles(articles_meta: list[dict]) -> list[CV_Article]:
+    articles: list[CV_Article] = []
+    for meta in articles_meta:
+        try:
+            articles.append(fetch_article(meta))
+        except Exception as e:
+            cv_id = meta.get("cv_id", "")
+            print(f"  [异常] cv{cv_id}：{e}，保留空章节")
+            article = CV_Article(cv_id)
+            article.title = f"文章 cv{cv_id}"
+            article.context = "<p>（抓取时发生异常）</p>"
+            articles.append(article)
+    return articles
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="B站文集 → EPUB 转换器")
-    parser.add_argument("readlist_id", nargs="?", default="36436", help="文集 ID，例如 702577")
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=DEFAULT_WORKERS,
-        help=f"文章并发数，默认 {DEFAULT_WORKERS}；如果触发限流可设为 1",
-    )
-    parser.add_argument(
-        "--image-workers",
-        type=int,
-        default=DEFAULT_IMAGE_WORKERS,
-        help=f"图片并发下载数，默认 {DEFAULT_IMAGE_WORKERS}",
-    )
+    parser.add_argument("readlist_id", nargs="?", help="文集 ID，例如 702577")
+    parser.add_argument("-c", "--config", help="配置文件路径，例如 config.ini")
     return parser.parse_args()
 
 
@@ -604,14 +765,21 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    readlist_id = str(args.readlist_id)
+    config, config_path = load_config(args.config)
+    apply_cookie_config(config, config_path)
+    config_readlist_id = config_value(
+        config,
+        [CONFIG_SECTION, "DEFAULT"],
+        ["readlist_id", "read_list_id", "id"],
+    )
+    readlist_id = str(args.readlist_id or config_readlist_id or "36436")
 
     print("正在获取文集信息…")
     readlist = ReadList(readlist_id)
     readlist.fetch()
 
-    articles = fetch_articles(readlist.articles_meta, max(1, args.workers))
-    c = Converter(readlist, articles, image_workers=max(1, args.image_workers))
+    articles = fetch_articles(readlist.articles_meta)
+    c = Converter(readlist, articles)
     c.convert_epub()
 
 
