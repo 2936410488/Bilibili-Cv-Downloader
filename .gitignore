@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# 本地配置、登录信息和下载产物
+config.ini
+cookies.txt
+.cache/
+*.epub
+
+# PyInstaller 产物
+build/
+dist/
+*.spec
