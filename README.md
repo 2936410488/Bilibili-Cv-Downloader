@@ -12,6 +12,9 @@ https://github.com/2936410488/Bilibili-Cv-Downloader
 - 自动下载正文图片、文集封面和每章 banner 图，重复 banner 只写入一份。
 - 支持新版页面的 `window.__INITIAL_STATE__` 正文结构。
 - 文章和图片按顺序抓取，并在网络请求之间间隔 1 秒，减少触发限流的风险。
+- 登录 Cookie 只发送给 `bilibili.com`，图片下载使用不带 Cookie 的独立会话。
+- 清理不适合 EPUB 的网页标签，并为图片、代码块和表格添加阅读样式。
+- 图片使用 URL 哈希缓存，避免同名图片互相覆盖。
 
 ## 安装
 
@@ -37,9 +40,16 @@ python converter.py 702577
 
 生成的 EPUB 会保存在当前目录，文件名使用文集标题。
 
+指定输出文件：
+
+```bash
+python converter.py 702577 -o ./books/my-book.epub
+```
+
 也可以通过配置文件运行：
 
 ```bash
+cp config.example.ini config.ini
 python converter.py -c config.ini
 ```
 
@@ -51,7 +61,7 @@ python converter.py --help
 
 ## Cookies
 
-如果部分文章需要登录访问，请把浏览器里的 Bilibili Cookie 粘贴到项目根目录的 `cookies.txt` 文件中。
+如果部分文章需要登录访问，请把浏览器里的 Bilibili Cookie 粘贴到项目根目录的 `cookies.txt` 文件中。该文件已被 `.gitignore` 忽略。
 
 格式示例：
 
@@ -59,7 +69,7 @@ python converter.py --help
 buvid3=...; b_nut=...; b_lsid=...; _uuid=...
 ```
 
-也可以在 `config.ini` 里指定 Cookie 文件位置和文集 ID：
+也可以在本地 `config.ini` 里指定 Cookie 文件位置和文集 ID：
 
 ```ini
 [converter]
@@ -67,7 +77,7 @@ readlist_id = 702577
 cookie_file = ./cookies.txt
 ```
 
-或者直接把 Cookie 按行填进配置文件；如果 `cookies` 有内容，会优先使用这里的内容：
+不推荐把 Cookie 直接写进配置文件。如果确有需要，也支持按行填写；如果 `cookies` 有内容，会优先使用这里的内容：
 
 ```ini
 [converter]
@@ -87,11 +97,19 @@ b_nut = ...
 SESSDATA = ...
 ```
 
+Cookie 会通过限定域名的 CookieJar 发送，仅用于 Bilibili 文章页面和 API；正文图片由不带 Cookie 的独立会话下载。不要分享 `cookies.txt` 或包含 Cookie 的本地配置文件。
+
 ## 缓存
 
 程序会把缓存写入 `.cache/`：
 
 - `.cache/cv_<文章ID>.html`：文章页面缓存
-- `.cache/imgs/`：图片缓存
+- `.cache/imgs/`：使用 URL 哈希命名的图片缓存
 
 如果怀疑缓存内容过期，可以删除 `.cache/` 后重新运行。
+
+## 测试
+
+```bash
+python -m unittest discover -s tests -v
+```

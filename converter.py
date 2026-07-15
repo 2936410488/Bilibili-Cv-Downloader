@@ -13,9 +13,12 @@ import json
 import argparse
 import configparser
 import hashlib
+import ipaddress
+import tempfile
 import time
+import unicodedata
 from html import escape
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 import sys
 
 import requests
@@ -24,7 +27,7 @@ from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from ebooklib import epub
 
-headers = {
+BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
     "Referer": "https://www.bilibili.com/",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -35,6 +38,7 @@ headers = {
 MIN_CONTENT_CHARS = 200
 REQUEST_TIMEOUT = 20
 REQUEST_DELAY_SECONDS = 1.0
+MAX_IMAGE_BYTES = 50 * 1024 * 1024
 CACHE_DIR = "./.cache"
 IMAGE_CACHE_DIR = os.path.join(CACHE_DIR, "imgs")
 IMAGE_EXTS = (".avif", ".webp", ".jpg", ".jpeg", ".png", ".gif")
@@ -42,13 +46,39 @@ DEFAULT_COOKIE_FILE = "./cookies.txt"
 CONFIG_SECTION = "converter"
 COOKIE_SECTION = "cookies"
 
-_session: requests.Session | None = None
+_authenticated_session: requests.Session | None = None
+_public_session: requests.Session | None = None
+_cookie_pairs: list[tuple[str, str]] = []
 _last_request_at = 0.0
 
 
-def build_session() -> requests.Session:
+def parse_cookie_pairs(cookie_text: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for part in normalize_cookie_text(cookie_text).split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        if name:
+            pairs.append((name, value.strip()))
+    return pairs
+
+
+def build_session(*, authenticated: bool = False) -> requests.Session:
     session = requests.Session()
-    session.headers.update(headers)
+    session.headers.update(BASE_HEADERS)
+    if authenticated:
+        # 使用 CookieJar 的域规则，而不是全局 Cookie 请求头。这样即使请求被重定向，
+        # 登录 Cookie 也不会发送给 bilibili.com 以外的站点。
+        for name, value in _cookie_pairs:
+            session.cookies.set(
+                name,
+                value,
+                domain=".bilibili.com",
+                path="/",
+                secure=True,
+            )
     retry = Retry(
         total=3,
         connect=3,
@@ -63,20 +93,34 @@ def build_session() -> requests.Session:
     return session
 
 
-def get_session() -> requests.Session:
-    global _session
-    if _session is None:
-        _session = build_session()
-    return _session
+def get_session(*, authenticated: bool = False) -> requests.Session:
+    global _authenticated_session, _public_session
+    if authenticated:
+        if _authenticated_session is None:
+            _authenticated_session = build_session(authenticated=True)
+        return _authenticated_session
+    if _public_session is None:
+        _public_session = build_session(authenticated=False)
+    return _public_session
 
 
-def throttled_get(url: str, *, timeout: int | float) -> requests.Response:
+def throttled_get(
+    url: str,
+    *,
+    timeout: int | float,
+    authenticated: bool = False,
+    stream: bool = False,
+) -> requests.Response:
     global _last_request_at
     elapsed = time.monotonic() - _last_request_at
     if elapsed < REQUEST_DELAY_SECONDS:
         time.sleep(REQUEST_DELAY_SECONDS - elapsed)
     try:
-        return get_session().get(url, timeout=timeout)
+        return get_session(authenticated=authenticated).get(
+            url,
+            timeout=timeout,
+            stream=stream,
+        )
     finally:
         _last_request_at = time.monotonic()
 
@@ -190,7 +234,7 @@ def load_cookie_file(path: str, *, explicit: bool = False) -> str:
 
 
 def apply_cookie_config(config: configparser.ConfigParser | None, config_path: str | None):
-    global _session
+    global _authenticated_session, _public_session, _cookie_pairs
     inline_cookie = config_value(
         config,
         [CONFIG_SECTION, COOKIE_SECTION, "DEFAULT"],
@@ -210,37 +254,62 @@ def apply_cookie_config(config: configparser.ConfigParser | None, config_path: s
         cookie_path = resolve_config_path(cookie_file, config_path)
         cookie_header = load_cookie_file(cookie_path, explicit=bool(explicit_cookie_file))
 
-    if cookie_header:
-        headers["Cookie"] = cookie_header
-    else:
-        headers.pop("Cookie", None)
-    _session = None
+    _cookie_pairs = parse_cookie_pairs(cookie_header) if cookie_header else []
+    _authenticated_session = None
+    _public_session = None
 
 
 # ─────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────
 
-def get_image_filename(url: str) -> str:
-    path = urlparse(url).path
-    basename = os.path.basename(path)
-    if "@" in basename:
-        base, suffix = basename.split("@", 1)
-        suffix_ext = os.path.splitext(suffix)[1].lower()
-        if suffix_ext in IMAGE_EXTS:
-            safe_suffix = re.sub(r"[^a-zA-Z0-9_.-]", "_", suffix)
-            return f"{base}_{safe_suffix}"
-        basename = base
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
 
-    img_id = basename
-    if "." not in img_id:
-        for ext in IMAGE_EXTS:
-            if ext in url:
-                img_id += ext
-                break
-        else:
-            img_id += ".jpg"
-    return img_id
+
+def safe_filename(
+    value: str,
+    fallback: str = "output",
+    max_length: int = 120,
+    max_bytes: int = 180,
+) -> str:
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    if not value:
+        value = fallback
+    if value.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
+        value = f"_{value}"
+    value = value[:max_length].rstrip(" .")
+    while value and len(value.encode("utf-8")) > max_bytes:
+        value = value[:-1].rstrip(" .")
+    return value or fallback
+
+
+def image_extension_from_url(url: str) -> str:
+    parsed_path = urlparse(url).path
+    ext = os.path.splitext(parsed_path)[1].lower()
+    if "@" in parsed_path:
+        transformed_ext = os.path.splitext(parsed_path.split("@", 1)[1])[1].lower()
+        if transformed_ext in IMAGE_EXTS:
+            ext = transformed_ext
+    if ext == ".jpeg":
+        return ".jpg"
+    return ext if ext in IMAGE_EXTS else ".jpg"
+
+
+def get_image_filename(url: str) -> str:
+    normalized = normalize_image_url(url, strip_transform=False)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    basename = os.path.basename(urlparse(normalized).path).split("@", 1)[0]
+    stem = safe_filename(os.path.splitext(basename)[0], "image", max_length=48)
+    return f"{digest}_{stem}{image_extension_from_url(normalized)}"
 
 
 def normalize_image_url(url: str, *, strip_transform: bool = True) -> str:
@@ -258,6 +327,71 @@ def normalize_image_url(url: str, *, strip_transform: bool = True) -> str:
     if strip_transform and "@" in url:
         url = url.split("@", 1)[0]
     return url
+
+
+def is_safe_image_url(url: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith((".localhost", ".local", ".internal")):
+        return False
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return True
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def sanitize_xhtml_fragment(fragment: str, *, base_url: str) -> str:
+    soup = BeautifulSoup(f'<div data-epub-root="1">{fragment or ""}</div>', "html.parser")
+    root = soup.find("div", attrs={"data-epub-root": "1"})
+    if root is None:
+        return ""
+
+    for element in root.find_all(
+        ["script", "iframe", "object", "embed", "form", "input", "button", "video", "audio", "source"]
+    ):
+        element.decompose()
+
+    for element in root.find_all(True):
+        for attr in list(element.attrs):
+            attr_lower = attr.lower()
+            if attr_lower.startswith("on") or attr_lower in {
+                "contenteditable",
+                "data-src",
+                "decoding",
+                "loading",
+                "srcset",
+                "style",
+            }:
+                del element.attrs[attr]
+
+        if element.name == "a":
+            href = str(element.get("href") or "").strip()
+            if href.startswith("#"):
+                continue
+            absolute_href = urljoin(base_url, href)
+            scheme = urlparse(absolute_href).scheme.lower()
+            if not href or scheme not in {"http", "https", "mailto"}:
+                element.attrs.pop("href", None)
+            else:
+                element["href"] = absolute_href
+
+        if element.name == "img":
+            src = str(element.get("src") or "")
+            if not src.startswith("images/"):
+                element.decompose()
+
+    return "".join(str(child) for child in root.contents)
 
 
 def extract_initial_state(html: str) -> dict | None:
@@ -308,7 +442,7 @@ class ReadList:
     def fetch(self):
         url = f"https://api.bilibili.com/x/article/list/web/articles?id={self.readlist_id}"
         try:
-            response = throttled_get(url, timeout=15)
+            response = throttled_get(url, timeout=15, authenticated=True)
             response.raise_for_status()
             data = response.json()
             if data["code"] == 0:
@@ -353,15 +487,37 @@ class CV_Article:
                     del img[attr]
 
     def _extract_banner_from_dom(self, soup: BeautifulSoup):
-        for source in soup.find_all("source"):
-            source_type = (source.get("type") or "").lower()
-            srcset = source.get("srcset") or ""
-            if "image/avif" not in source_type or not srcset:
+        # 新版页面通常会在同一个 picture 中提供 AVIF、WebP 和 img 回退。
+        # 优先选择兼容性更好的 JPEG/PNG/WebP，只在没有其他候选时使用 AVIF。
+        priorities = {
+            "image/jpeg": 0,
+            "image/png": 1,
+            "image/webp": 2,
+            "image/avif": 3,
+        }
+        for picture in soup.find_all("picture"):
+            sources = picture.find_all("source")
+            if not any("image/avif" in (source.get("type") or "").lower() for source in sources):
                 continue
-            banner_url = normalize_image_url(srcset, strip_transform=False)
-            if banner_url:
-                self.banner_url = banner_url
-                return
+
+            candidates: list[tuple[int, str]] = []
+            for source in sources:
+                source_type = (source.get("type") or "").lower()
+                srcset = source.get("srcset") or ""
+                if srcset and source_type in priorities:
+                    candidates.append((priorities[source_type], srcset))
+
+            image = picture.find("img")
+            if image:
+                image_url = image.get("data-src") or image.get("src") or ""
+                if image_url:
+                    candidates.append((1, image_url))
+
+            for _, candidate in sorted(candidates, key=lambda item: item[0]):
+                banner_url = normalize_image_url(candidate, strip_transform=False)
+                if banner_url:
+                    self.banner_url = banner_url
+                    return
 
     def _extract_banner_from_state(self, read_info: dict):
         if self.banner_url:
@@ -506,7 +662,7 @@ class CV_Article:
         url = f"https://www.bilibili.com/read/cv{self.cv_id}/?from=readlist&opus_fallback=1"
         print(f"  [CV请求] {url}")
         try:
-            resp = throttled_get(url, timeout=REQUEST_TIMEOUT)
+            resp = throttled_get(url, timeout=REQUEST_TIMEOUT, authenticated=True)
             if resp.status_code != 200:
                 print(f"  [CV请求] HTTP {resp.status_code}")
                 return False
@@ -546,35 +702,102 @@ class CV_Article:
 # ─────────────────────────────────────────────
 
 def download_image(url: str) -> bytes | None:
+    if not is_safe_image_url(url):
+        print(f"  [跳过不安全图片地址] {url}")
+        return None
+
     img_filename = get_image_filename(url)
     os.makedirs(IMAGE_CACHE_DIR, exist_ok=True)
     fn = os.path.join(IMAGE_CACHE_DIR, img_filename)
 
     if os.path.exists(fn):
         with open(fn, "rb") as f:
+            cached = f.read(MAX_IMAGE_BYTES + 1)
+        if 0 < len(cached) <= MAX_IMAGE_BYTES and sniff_image_format(cached):
             print(f"  [缓存图片] {img_filename}")
-            return f.read()
+            return cached
+        print(f"  [损坏图片缓存] {img_filename}，重新下载")
+        try:
+            os.remove(fn)
+        except OSError:
+            pass
 
+    temp_path: str | None = None
     try:
-        response = throttled_get(url, timeout=REQUEST_TIMEOUT)
-        content_type = response.headers.get("content-type", "")
-        if "image" not in content_type:
-            print(f"  [非图片] {url}（Content-Type: {content_type}）")
+        response = throttled_get(url, timeout=REQUEST_TIMEOUT, stream=True)
+        with response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            if not content_type.startswith("image/"):
+                print(f"  [非图片] {url}（Content-Type: {content_type}）")
+                return None
+
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > MAX_IMAGE_BYTES:
+                print(f"  [图片过大] {url}（上限 {MAX_IMAGE_BYTES // 1024 // 1024} MB）")
+                return None
+
+            content = bytearray()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                content.extend(chunk)
+                if len(content) > MAX_IMAGE_BYTES:
+                    print(f"  [图片过大] {url}（上限 {MAX_IMAGE_BYTES // 1024 // 1024} MB）")
+                    return None
+
+        if not content:
+            print(f"  [空图片] {url}")
             return None
-        with open(fn, "wb") as f:
-            f.write(response.content)
-        return response.content
+
+        image_data = bytes(content)
+        if not sniff_image_format(image_data):
+            print(f"  [无法识别的图片格式] {url}")
+            return None
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".image-",
+            dir=IMAGE_CACHE_DIR,
+            delete=False,
+        ) as temp_file:
+            temp_file.write(image_data)
+            temp_path = temp_file.name
+        os.replace(temp_path, fn)
+        return image_data
     except Exception as e:
         print(f"  [图片下载失败] {url}：{e}")
         return None
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
-def mime_and_ext(url: str) -> tuple[str, str]:
-    ext = os.path.splitext(urlparse(url).path)[1].lower()
-    if "@" in url:
-        transform_ext = os.path.splitext(url.split("@", 1)[1])[1].lower()
-        if transform_ext in IMAGE_EXTS:
-            ext = transform_ext
+def sniff_image_format(image_data: bytes) -> tuple[str, str] | None:
+    if image_data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+    if image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+    if image_data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", ".gif"
+    if len(image_data) >= 12 and image_data[:4] == b"RIFF" and image_data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    if len(image_data) >= 12 and image_data[4:8] == b"ftyp":
+        brands = image_data[8:32]
+        if b"avif" in brands or b"avis" in brands:
+            return "image/avif", ".avif"
+    return None
+
+
+def mime_and_ext(url: str, image_data: bytes | None = None) -> tuple[str, str]:
+    if image_data:
+        detected = sniff_image_format(image_data)
+        if detected:
+            return detected
+
+    ext = image_extension_from_url(url)
     mapping = {
         ".avif": ("image/avif", ".avif"),
         ".jpg":  ("image/jpeg", ".jpg"),
@@ -602,7 +825,19 @@ def make_banner_html(article: CV_Article, banner_path: str | None) -> str:
         return ""
     src = banner_path
     alt = escape(article.title or "")
-    return f'<p><img src="{src}" alt="{alt}" style="max-width:100%;height:auto;"/></p>'
+    return f'<p class="chapter-banner"><img src="{src}" alt="{alt}"/></p>'
+
+
+BOOK_CSS = b"""
+body { font-family: sans-serif; line-height: 1.7; margin: 5%; }
+h1 { line-height: 1.3; }
+img { display: block; max-width: 100%; height: auto; margin: 1em auto; }
+pre, code { white-space: pre-wrap; overflow-wrap: anywhere; }
+table { width: 100%; border-collapse: collapse; }
+th, td { border: 1px solid #999; padding: 0.35em; }
+blockquote { margin-left: 0; padding-left: 1em; border-left: 0.25em solid #aaa; }
+.chapter-source { margin-top: 2em; font-size: 0.85em; color: #666; }
+"""
 
 
 # ─────────────────────────────────────────────
@@ -618,7 +853,7 @@ class Converter:
     def _add_epub_image(self, ebook: epub.EpubBook, img_url: str, epub_path: str, image_data: bytes):
         if epub_path in self._added_epub_paths:
             return
-        mime, ext = mime_and_ext(img_url)
+        mime, _ = mime_and_ext(img_url, image_data)
         uid = re.sub(r"[^a-zA-Z0-9_]", "_", os.path.basename(epub_path))
         image_item = epub.EpubImage(
             uid=f"img_{uid}",
@@ -669,17 +904,29 @@ class Converter:
 
         return banner_path_by_url
 
-    def convert_epub(self):
+    def convert_epub(self, output_path: str | None = None) -> str:
+        self._added_epub_paths.clear()
         ebook = epub.EpubBook()
+        book_name = self.read_list.name or f"Bilibili文集{self.read_list.readlist_id}"
         ebook.set_identifier(f"bilibili_rl_{self.read_list.readlist_id}")
-        ebook.set_title(self.read_list.name)
+        ebook.set_title(book_name)
         ebook.set_language("zh-CN")
-        ebook.add_author(self.read_list.author)
+        if self.read_list.author:
+            ebook.add_author(self.read_list.author)
 
         if self.read_list.cover_url:
             cover_data = download_image(self.read_list.cover_url)
             if cover_data:
-                ebook.set_cover("cover.jpg", cover_data)
+                _, cover_ext = mime_and_ext(self.read_list.cover_url, cover_data)
+                ebook.set_cover(f"cover{cover_ext}", cover_data)
+
+        book_style = epub.EpubItem(
+            uid="style_book",
+            file_name="styles/book.css",
+            media_type="text/css",
+            content=BOOK_CSS,
+        )
+        ebook.add_item(book_style)
 
         banner_path_by_url = self._add_banner_images(ebook)
         chapters = []
@@ -689,9 +936,13 @@ class Converter:
             if not article.context:
                 continue
 
+            article_title = article.title or f"第{idx+1}章"
+            safe_article_title = escape(article_title)
+            source_url = f"https://www.bilibili.com/read/cv{article.cv_id}"
+            clean_context = sanitize_xhtml_fragment(article.context, base_url=source_url)
             banner_html = make_banner_html(article, banner_path_by_url.get(article.banner_url or ""))
             chapter = epub.EpubHtml(
-                title=article.title or f"第{idx+1}章",
+                title=article_title,
                 file_name=f"article{idx}.xhtml",
                 lang="zh-CN",
             )
@@ -699,15 +950,17 @@ class Converter:
 <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN"
   "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml">
-<head><title>{article.title}</title></head>
+<head><title>{safe_article_title}</title></head>
 <body>
-  <h1>{article.title}</h1>
+  <h1>{safe_article_title}</h1>
   {banner_html}
   <hr/>
-  {article.context}
+  {clean_context}
+  <p class="chapter-source">原文：<a href="{source_url}">{source_url}</a></p>
 </body>
 </html>""".encode("utf-8")
 
+            chapter.add_item(book_style)
             ebook.add_item(chapter)
             chapters.append(chapter)
 
@@ -719,14 +972,31 @@ class Converter:
             if image_data:
                 self._add_epub_image(ebook, img_url, epub_path, image_data)
 
-        ebook.toc = [(epub.Section(self.read_list.name), chapters)]
+        ebook.toc = [(epub.Section(book_name), chapters)]
         ebook.add_item(epub.EpubNcx())
         ebook.add_item(epub.EpubNav())
         ebook.spine = ["nav"] + chapters
 
-        out_fn = f"{self.read_list.name}.epub"
-        epub.write_epub(out_fn, ebook, {})
+        if output_path:
+            out_fn = os.path.abspath(os.path.expanduser(output_path))
+            if not out_fn.lower().endswith(".epub"):
+                out_fn += ".epub"
+        else:
+            out_fn = os.path.abspath(f"{safe_filename(book_name, 'bilibili-readlist')}.epub")
+
+        output_dir = os.path.dirname(out_fn) or os.getcwd()
+        os.makedirs(output_dir, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(prefix=".epub-build-", suffix=".epub", dir=output_dir)
+        os.close(fd)
+        try:
+            epub.write_epub(temp_path, ebook, {})
+            os.replace(temp_path, out_fn)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
         print(f"\n✅ 已生成：{out_fn}")
+        return out_fn
 
 
 def fetch_article(meta: dict) -> CV_Article:
@@ -756,6 +1026,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="B站文集 → EPUB 转换器")
     parser.add_argument("readlist_id", nargs="?", help="文集 ID，例如 702577")
     parser.add_argument("-c", "--config", help="配置文件路径，例如 config.ini")
+    parser.add_argument("-o", "--output", help="输出 EPUB 路径，例如 ./books/文集.epub")
     return parser.parse_args()
 
 
@@ -763,7 +1034,7 @@ def parse_args() -> argparse.Namespace:
 # 主流程
 # ─────────────────────────────────────────────
 
-def main():
+def main() -> int:
     args = parse_args()
     config, config_path = load_config(args.config)
     apply_cookie_config(config, config_path)
@@ -772,7 +1043,13 @@ def main():
         [CONFIG_SECTION, "DEFAULT"],
         ["readlist_id", "read_list_id", "id"],
     )
-    readlist_id = str(args.readlist_id or config_readlist_id or "36436")
+    readlist_id = str(args.readlist_id or config_readlist_id or "").strip()
+    if not readlist_id:
+        print("错误：请提供文集 ID，或在配置文件中设置 readlist_id。", file=sys.stderr)
+        return 2
+    if not re.fullmatch(r"\d+", readlist_id):
+        print(f"错误：文集 ID 必须是纯数字，当前值为 {readlist_id!r}。", file=sys.stderr)
+        return 2
 
     print("正在获取文集信息…")
     readlist = ReadList(readlist_id)
@@ -780,8 +1057,9 @@ def main():
 
     articles = fetch_articles(readlist.articles_meta)
     c = Converter(readlist, articles)
-    c.convert_epub()
+    c.convert_epub(args.output)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
